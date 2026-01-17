@@ -1,5 +1,5 @@
 discord.py
 python-dotenv
-aiosqlite
+libsql-client
 pytz
 apscheduler

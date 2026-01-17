@@ -44,6 +44,7 @@ A feature-rich Discord bot to manage your personal to-do list directly within Di
 | `/tasks` | Show the top 5 tasks due soonest. Overdue tasks appear first. | `/tasks` |
 | `/alltasks` | Show **every** task in your list, sorted by date. | `/alltasks` |
 | `/gettask` | Get a single random task to focus on. Prioritizes tasks due today/overdue. | `/gettask` |
+| `/givetask <user> <name> [date]` | Assign a task to another user. They must confirm it via buttons. | `/givetask @User Clean kitchen 1` |
 
 ### Settings
 | Command | Description | Example |

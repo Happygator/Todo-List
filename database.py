@@ -1,123 +1,75 @@
-import aiosqlite
+import libsql_client
 import datetime
 import os
+from dotenv import load_dotenv
 
-DB_NAME = "todo.db"
+load_dotenv()
 
-# Hardcoded default user ID for migration
-DEFAULT_USER_ID = 342869056203784202
+DB_URL = os.getenv("TURSO_DATABASE_URL")
+DB_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+# Normalize URL to https
+if DB_URL and DB_URL.startswith("libsql://"):
+    DB_URL = DB_URL.replace("libsql://", "https://")
+
+async def get_client():
+    return libsql_client.create_client(DB_URL, auth_token=DB_TOKEN)
 
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Check if we need to migrate 'tasks'
-        # Simple check: does 'user_id' column exist?
-        cursor = await db.execute("PRAGMA table_info(tasks)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        
-        await db.execute("""
+    # Tables specific to this app
+    async with await get_client() as client:
+        await client.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 due_date TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                assigner_id TEXT
             )
         """)
         
-        if 'user_id' not in columns and 'tasks' in columns: # Wait, if tasks exists but no user_id
-             # This means it's the old schema. We need to handle this manually or via migration script.
-             # But init_db CREATE TABLE IF NOT EXISTS won't alter it.
-             pass
-
-        # Check 'settings' table
-        cursor = await db.execute("PRAGMA table_info(settings)")
-        settings_columns = [row[1] for row in await cursor.fetchall()]
-
-        await db.execute("""
+        await client.execute("""
             CREATE TABLE IF NOT EXISTS settings (
-                user_id INTEGER,
+                user_id TEXT,
                 key TEXT,
                 value TEXT,
                 PRIMARY KEY (user_id, key)
             )
         """)
-        
-        await db.commit()
 
 async def migrate_to_multi_user():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # 1. Migrate TASKS
-        cursor = await db.execute("PRAGMA table_info(tasks)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        
-        if 'user_id' not in columns:
-            print("Migrating tasks table to multi-user...")
-            await db.execute("ALTER TABLE tasks ADD COLUMN user_id INTEGER")
-            await db.execute("UPDATE tasks SET user_id = ?", (DEFAULT_USER_ID,))
-            await db.commit()
-            print("Tasks table migrated.")
-            
-        # 2. Migrate SETTINGS
-        cursor = await db.execute("PRAGMA table_info(settings)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        
-        if 'user_id' not in columns:
-            print("Migrating settings table to multi-user...")
-            await db.execute("ALTER TABLE settings RENAME TO settings_old")
-            await db.execute("""
-                CREATE TABLE settings (
-                    user_id INTEGER,
-                    key TEXT,
-                    value TEXT,
-                    PRIMARY KEY (user_id, key)
-                )
-            """)
-            # Copy old settings to default user
-            await db.execute(
-                "INSERT INTO settings (user_id, key, value) SELECT ?, key, value FROM settings_old", 
-                (DEFAULT_USER_ID,)
-            )
-            await db.execute("DROP TABLE settings_old")
-            await db.commit()
-            print("Settings table migrated.")
+    # No-op for Turso as we assume schema is correct or handled by migration script/init
+    pass
 
 async def fix_date_formats():
-    """Normalize all dates to ISO 8601 (YYYY-MM-DD) to ensure correct sorting."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT id, due_date FROM tasks WHERE due_date IS NOT NULL") as cursor:
-            tasks = await cursor.fetchall()
-            
-        for task in tasks:
-            original = task['due_date']
-            try:
-                # Try parsing as YYYY-MM-DD
-                dt = datetime.datetime.strptime(original, "%Y-%m-%d")
-                iso = dt.date().isoformat()
-                if iso != original:
-                    await db.execute("UPDATE tasks SET due_date = ? WHERE id = ?", (iso, task['id']))
-            except ValueError:
-                pass
-        await db.commit()
+    # Can stick to simple update if needed, but avoiding full scan is better.
+    # We'll skip this for now or implement if needed. 
+    # Turso is remote, minimizing round trips is good.
+    pass
 
-async def add_task(user_id: int, name: str, due_date: str = None) -> int:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "INSERT INTO tasks (user_id, name, due_date) VALUES (?, ?, ?)",
-            (user_id, name, due_date)
+async def add_task(user_id: int, name: str, due_date: str = None, assigner_id: int = None) -> int:
+    if assigner_id is None:
+        assigner_id = user_id
+        
+    async with await get_client() as client:
+        # libsql_client usually returns last_insert_rowid in some way? 
+        # For HTTP, it might not directly return via cursor.lastrowid
+        # We might need to do INSERT RETURNING id if supported (SQLite 3.35+)
+        # Turso supports RETURNING.
+        
+        rs = await client.execute(
+            "INSERT INTO tasks (user_id, name, due_date, assigner_id) VALUES (?, ?, ?, ?) RETURNING id",
+            [user_id, name, due_date, assigner_id]
         )
-        await db.commit()
-        return cursor.lastrowid
+        return rs.rows[0][0]
 
 async def delete_task(user_id: int, task_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Enforce user_id check so users can't delete each other's tasks
-        cursor = await db.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
-        await db.commit()
-        return cursor.rowcount > 0
+    async with await get_client() as client:
+        rs = await client.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", [task_id, user_id])
+        return rs.rows_affected > 0
 
 async def delete_tasks(user_id: int, task_ids: list[int]) -> int:
-    """Delete multiple tasks at once. Returns count of deleted tasks."""
     if not task_ids:
         return 0
     
@@ -125,61 +77,85 @@ async def delete_tasks(user_id: int, task_ids: list[int]) -> int:
     sql = f"DELETE FROM tasks WHERE user_id = ? AND id IN ({placeholders})"
     params = [user_id] + task_ids
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(sql, params)
-        await db.commit()
-        return cursor.rowcount
+    async with await get_client() as client:
+        rs = await client.execute(sql, params)
+        return rs.rows_affected
+
+def row_to_dict(row, columns):
+    return dict(zip(columns, row))
 
 async def get_top_tasks(user_id: int, limit: int = 5):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        # Order by due_date ASC, with NULLs last
-        async with db.execute(
-            "SELECT * FROM tasks WHERE user_id = ? ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC LIMIT ?", 
-            (user_id, limit)
-        ) as cursor:
-            return await cursor.fetchall()
+    async with await get_client() as client:
+        rs = await client.execute(
+            """
+            SELECT * FROM tasks 
+            WHERE user_id = ? 
+            ORDER BY 
+                CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, 
+                due_date ASC, 
+                CASE WHEN assigner_id = user_id THEN 0 ELSE 1 END,
+                assigner_id ASC
+            LIMIT ?
+            """, 
+            [user_id, limit]
+        )
+        # Convert to list of dicts for compatibility
+        columns = list(rs.columns)
+        return [row_to_dict(row, columns) for row in rs.rows]
 
 async def get_tasks_for_reminders(user_id: int, target_date: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM tasks WHERE user_id = ? AND due_date = ?", (user_id, target_date)) as cursor:
-            return await cursor.fetchall()
+    async with await get_client() as client:
+        rs = await client.execute("SELECT * FROM tasks WHERE user_id = ? AND due_date = ?", [user_id, target_date])
+        columns = list(rs.columns)
+        return [row_to_dict(row, columns) for row in rs.rows]
             
 async def rollover_past_tasks(user_id: int, target_date: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
+    async with await get_client() as client:
+        await client.execute(
             "UPDATE tasks SET due_date = ? WHERE user_id = ? AND due_date < ? AND due_date IS NOT NULL",
-            (target_date, user_id, target_date)
+            [target_date, user_id, target_date]
         )
-        await db.commit()
 
 async def get_all_undone_tasks_sorted(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM tasks WHERE user_id = ? ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC, id ASC",
-            (user_id,)
-        ) as cursor:
-            return await cursor.fetchall()
+    async with await get_client() as client:
+        rs = await client.execute(
+            """
+            SELECT * FROM tasks 
+            WHERE user_id = ? 
+            ORDER BY 
+                CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, 
+                due_date ASC, 
+                CASE WHEN assigner_id = user_id THEN 0 ELSE 1 END,
+                assigner_id ASC,
+                id ASC
+            """,
+            [user_id]
+        )
+        columns = list(rs.columns)
+        return [row_to_dict(row, columns) for row in rs.rows]
 
 async def set_setting(user_id: int, key: str, value: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
+    async with await get_client() as client:
+        await client.execute(
             "INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, ?, ?)",
-            (user_id, key, value)
+            [user_id, key, value]
         )
-        await db.commit()
 
 async def get_setting(user_id: int, key: str) -> str:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
+    async with await get_client() as client:
+        rs = await client.execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", [user_id, key])
+        if rs.rows:
+            return rs.rows[0][0]
+        return None
 
 async def get_users_with_settings():
     """Get all unique user_ids that have settings (e.g. timezone) configured."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT DISTINCT user_id FROM settings") as cursor:
-            return [row['user_id'] for row in await cursor.fetchall()]
+    async with await get_client() as client:
+        rs = await client.execute("SELECT DISTINCT user_id FROM settings")
+        if not rs.rows:
+            return []
+        
+        # Check if returned as tuples or just values? Usually tuples in rows.
+        # rs.rows[0] is (value,) or value?
+        # Based on previous check, likely tuple/sequence.
+        return [row[0] for row in rs.rows]

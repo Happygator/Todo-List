@@ -21,6 +21,7 @@ class TodoBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.last_reminder_dates = {} # {user_id: date}
+        self.user_cache = {} # {user_id: UserObj}
 
     async def setup_hook(self):
         await database.init_db()
@@ -31,19 +32,17 @@ class TodoBot(discord.Client):
 
     async def on_ready(self):
         print(f'Logged in as {self.user} (ID: {self.user.id})')
-        # We can't easily DM *everyone* on startup without iterating. 
-        # But we can try to DM users we know about (migration target).
-        # For now, let's skip the "online" DM broadcast to avoid mass spam if bot restarts,
-        # or just implement it for users we find in settings.
         
         users = await database.get_users_with_settings()
         for user_id in users:
              try:
                 user = await self.fetch_user(user_id)
-                if user:
-                    await self.send_daily_summary(user_id, user, is_startup=True)
+                self.user_cache[user_id] = user # cache it
+                # Startup message removed per user request
+                # if user:
+                #    await self.send_daily_summary(user_id, user, is_startup=True)
              except Exception as e:
-                print(f"Failed to send startup message to {user_id}: {e}")
+                print(f"Failed to cache user {user_id}: {e}")
 
     async def send_daily_summary(self, user_id, user_obj, is_startup=False):
         # Get timezone 
@@ -85,14 +84,38 @@ class TodoBot(discord.Client):
             if tasks:
                 msg = header
                 for task in tasks:
-                    date_display = self.format_task_date(task['due_date'])
-                    msg += f"- [ID: {task['id']}] {task['name']} ({date_display})\n"
+                    msg += await self.format_task_display(task)
                 await user_obj.send(msg)
             else:
                  await user_obj.send(header)
 
         except Exception as e:
             print(f"Error sending summary to {user_id}: {e}")
+
+    def parse_date(self, date_str):
+        """Helper to parse date string (YYYY-MM-DD or days offset) into YYYY-MM-DD string."""
+        if not date_str:
+            return None
+            
+        final_date_str = None
+        if date_str.isdigit():
+            days = int(date_str)
+            target_date = (datetime.date.today() + datetime.timedelta(days=days))
+            final_date_str = target_date.isoformat()
+        else:
+            try:
+                dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                final_date_str = dt.date().isoformat()
+            except ValueError:
+                return None # parsing failed
+        
+        # Enforce rule: No past dates.
+        if final_date_str:
+            today_iso = datetime.date.today().isoformat()
+            if final_date_str < today_iso:
+                final_date_str = today_iso
+                
+        return final_date_str
 
     def format_task_date(self, date_str):
         if not date_str:
@@ -115,6 +138,36 @@ class TodoBot(discord.Client):
                 return f"Due: {date_str}"
         except ValueError:
             return date_str
+
+    async def format_task_display(self, task):
+        date_display = self.format_task_date(task['due_date'])
+        
+        assigner_str = ""
+        # Check if assigned by someone else
+        if task['assigner_id'] != task['user_id']:
+            assigner_id = task['assigner_id']
+            assigner_name = f"User {assigner_id}"
+            
+            # Check cache
+            if assigner_id in self.user_cache:
+                assigner = self.user_cache[assigner_id]
+                assigner_name = assigner.display_name
+            else:
+                try:
+                    # Try to get from cache first, then fetch
+                    assigner = self.get_user(assigner_id)
+                    if not assigner:
+                        assigner = await self.fetch_user(assigner_id)
+                    
+                    if assigner:
+                        self.user_cache[assigner_id] = assigner
+                        assigner_name = assigner.display_name
+                except Exception as e:
+                    print(f"Error fetching user {assigner_id}: {e}")
+            
+            assigner_str = f" (from {assigner_name})"
+
+        return f"- [ID: {task['id']}] {task['name']} ({date_display}){assigner_str}\n"
 
     @tasks.loop(minutes=1)
     async def daily_reminder(self):
@@ -149,32 +202,94 @@ class TodoBot(discord.Client):
     async def before_daily_reminder(self):
         await self.wait_until_ready()
 
+class GiveTaskView(discord.ui.View):
+    def __init__(self, target_user_id, requester_user_id, task_name, task_date_str, bot_instance):
+        super().__init__(timeout=300) # 5 minute timeout
+        self.target_user_id = target_user_id
+        self.requester_user_id = requester_user_id
+        self.task_name = task_name
+        self.task_date_str = task_date_str
+        self.bot = bot_instance
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("This confirmation is not for you!", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Pass requester_user_id as assigner_id
+        task_id = await database.add_task(self.target_user_id, self.task_name, self.task_date_str, assigner_id=self.requester_user_id)
+        date_display = self.bot.format_task_date(self.task_date_str) if self.task_date_str else ""
+        
+        # Disable buttons
+        for child in self.children:
+            child.disabled = True
+        
+        await interaction.response.edit_message(
+            content=f"✅ Task accepted and added! **{self.task_name}** ({date_display}) (ID: {task_id})", 
+            view=self
+        )
+        self.stop()
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable buttons
+        for child in self.children:
+            child.disabled = True
+            
+        await interaction.response.edit_message(
+            content=f"❌ Task declined: **{self.task_name}**", 
+            view=self
+        )
+        self.stop()
+
 bot = TodoBot()
+
+@bot.tree.command(name="givetask", description="Assign a task to another user (requires their confirmation)")
+@app_commands.describe(user="The user to assign the task to", name="The task name", date="Due date (YYYY-MM-DD) OR days from now")
+async def givetask(interaction: discord.Interaction, user: discord.User, name: str, date: str = None):
+    # Parse date
+    final_date_str = None
+    if date:
+        final_date_str = bot.parse_date(date)
+        if final_date_str is None:
+             await interaction.response.send_message("Invalid date format. Please use YYYY-MM-DD or a number of days.", ephemeral=True)
+             return
+
+    # Create view
+    view = GiveTaskView(
+        target_user_id=user.id,
+        requester_user_id=interaction.user.id,
+        task_name=name,
+        task_date_str=final_date_str,
+        bot_instance=bot
+    )
+    
+    date_display = bot.format_task_date(final_date_str) if final_date_str else "No due date"
+    msg = f"**{interaction.user.display_name}** wants to assign you a task:\n**{name}**\nDue: {date_display}\n\nDo you accept?"
+    
+    try:
+        await user.send(msg, view=view)
+        await interaction.response.send_message(f"Task request sent to {user.mention} via DM.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Could not DM {user.mention}. They might have DMs blocked.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to send DM: {e}", ephemeral=True)
 
 @bot.tree.command(name="add", description="Add a new task")
 @app_commands.describe(name="The task name", date="Due date (YYYY-MM-DD) OR days from now (e.g. 1 for tomorrow)")
 async def add(interaction: discord.Interaction, name: str, date: str = None):
-    # Validate date
     final_date_str = None
     if date:
-        if date.isdigit():
-            days = int(date)
-            target_date = (datetime.date.today() + datetime.timedelta(days=days))
-            final_date_str = target_date.isoformat()
-        else:
-            try:
-                dt = datetime.datetime.strptime(date, "%Y-%m-%d")
-                final_date_str = dt.date().isoformat()
-            except ValueError:
-                await interaction.response.send_message("Invalid date format. Please use YYYY-MM-DD or a number of days.", ephemeral=True)
-                return
-    
-    # Enforce rule: No past dates.
-    today_iso = datetime.date.today().isoformat()
-    if final_date_str and final_date_str < today_iso:
-        final_date_str = today_iso
+        final_date_str = bot.parse_date(date)
+        if final_date_str is None:
+             await interaction.response.send_message("Invalid date format. Please use YYYY-MM-DD or a number of days.", ephemeral=True)
+             return
 
-    task_id = await database.add_task(interaction.user.id, name, final_date_str)
+    # Pass assigner_id=interaction.user.id (explicitly self-assigned)
+    task_id = await database.add_task(interaction.user.id, name, final_date_str, assigner_id=interaction.user.id)
     date_display = bot.format_task_date(final_date_str) if final_date_str else ""
     await interaction.response.send_message(f"Task added: **{name}** ({date_display}) (ID: {task_id})")
 
@@ -202,35 +317,35 @@ async def complete(interaction: discord.Interaction, task_ids_str: str):
 
 @bot.tree.command(name="tasks", description="Show 5 upcoming tasks")
 async def tasks_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
     tasks = await database.get_top_tasks(interaction.user.id, limit=5)
     if not tasks:
-        await interaction.response.send_message("No upcoming tasks found.")
+        await interaction.followup.send("No upcoming tasks found.")
         return
 
     msg = "**Upcoming Tasks:**\n"
     for task in tasks:
-        date_display = bot.format_task_date(task['due_date'])
-        msg += f"- [ID: {task['id']}] {task['name']} ({date_display})\n"
+        msg += await bot.format_task_display(task)
     
-    await interaction.response.send_message(msg)
+    await interaction.followup.send(msg)
 
 @bot.tree.command(name="alltasks", description="Show all tasks")
 async def alltasks(interaction: discord.Interaction):
+    await interaction.response.defer()
     tasks = await database.get_all_undone_tasks_sorted(interaction.user.id)
     if not tasks:
-        await interaction.response.send_message("No tasks found.")
+        await interaction.followup.send("No tasks found.")
         return
 
     msg_header = "**All Tasks:**\n"
     current_msg = msg_header
     
     for task in tasks:
-        date_display = bot.format_task_date(task['due_date'])
-        line = f"- [ID: {task['id']}] {task['name']} ({date_display})\n"
+        line = await bot.format_task_display(task)
         
         if len(current_msg) + len(line) > 1900: 
             if current_msg == msg_header:
-                 await interaction.response.send_message(current_msg)
+                 await interaction.followup.send(current_msg)
             else:
                  await interaction.followup.send(current_msg)
             current_msg = line
@@ -238,13 +353,8 @@ async def alltasks(interaction: discord.Interaction):
             current_msg += line
 
     if current_msg:
-        if current_msg == msg_header:
-             await interaction.response.send_message(current_msg)
-        else:
-             if interaction.response.is_done():
-                 await interaction.followup.send(current_msg)
-             else:
-                 await interaction.response.send_message(current_msg)
+        # Since we always defer, is_done is always true, so always followup
+        await interaction.followup.send(current_msg)
 
 @bot.tree.command(name="gettask", description="Get a random task to focus on")
 async def gettask(interaction: discord.Interaction):
