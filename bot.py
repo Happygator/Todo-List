@@ -429,5 +429,69 @@ async def timezone_cmd(interaction: discord.Interaction, tz: str):
     await database.set_setting(interaction.user.id, 'timezone', target_tz)
     await interaction.response.send_message(f"Timezone set to: {target_tz}")
 
+import socket
+import sys
+
+# ... (existing imports)
+
+
+# ... (imports)
+
+def check_single_instance():
+    """Ensure only one instance, and return socket for shutdown listener."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Try to bind
+        sock.bind(("127.0.0.1", 60001))
+        sock.listen(1) # Listen for shutdown signal
+        sock.setblocking(False) # Non-blocking for asyncio
+    except socket.error:
+        print("Error: Another instance of the bot is already running.")
+        sys.exit(1)
+    
+    return sock
+
+async def shutdown_listener(sock):
+    """Background task to listen for shutdown signals on the socket."""
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            # Accept connection
+            client, _ = await loop.sock_accept(sock)
+            
+            # Read data
+            data = await loop.sock_recv(client, 1024)
+            if data == b"SHUTDOWN":
+                print("Received shutdown signal. Closing bot...")
+                client.close()
+                await bot.close()
+                break
+            client.close()
+        except:
+             # Ignore errors to keep listener alive
+             pass
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    lock_socket = check_single_instance()
+    
+    # We need to inject the listener into the bot's loop once it starts
+    # setup_hook is a good place, but we need to pass lock_socket to the bot instance
+    # OR we can just add it to the loop in setup_hook if we make lock_socket global or attached to bot.
+    bot.lock_socket = lock_socket 
+    
+    # Monkey patch setup_hook to add the listener task? 
+    # Or just subclass properly? We already have TodoBot class.
+    # Let's attach the task in TodoBot.setup_hook
+    
+    old_setup = bot.setup_hook
+    
+    async def new_setup():
+        await old_setup()
+        bot.loop.create_task(shutdown_listener(bot.lock_socket))
+        
+    bot.setup_hook = new_setup
+    
+    try:
+        bot.run(TOKEN)
+    finally:
+        lock_socket.close()
