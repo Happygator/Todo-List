@@ -40,7 +40,7 @@ A feature-rich Discord bot to manage your personal to-do list directly within Di
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `/add <name> [date]` | Add a new task. Date can be `YYYY-MM-DD` or a number of days from now (e.g. `1` for tomorrow). | `/add Buy milk 1` |
-| `/complete <id>` | Mark a task as complete and remove it permanently options. | `/complete 12` |
+| `/complete <ids>` | Mark task(s) as complete. Separate IDs with commas (e.g. `1,2,5`). | `/complete 1,5` |
 | `/tasks` | Show the top 5 tasks due soonest. Overdue tasks appear first. | `/tasks` |
 | `/alltasks` | Show **every** task in your list, sorted by date. | `/alltasks` |
 | `/gettask` | Get a single random task to focus on. Prioritizes tasks due today/overdue. | `/gettask` |

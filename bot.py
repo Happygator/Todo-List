@@ -178,14 +178,27 @@ async def add(interaction: discord.Interaction, name: str, date: str = None):
     date_display = bot.format_task_date(final_date_str) if final_date_str else ""
     await interaction.response.send_message(f"Task added: **{name}** ({date_display}) (ID: {task_id})")
 
-@bot.tree.command(name="complete", description="Mark a task as complete (removes it)")
-@app_commands.describe(task_id="The ID of the task to complete")
-async def complete(interaction: discord.Interaction, task_id: int):
-    success = await database.delete_task(interaction.user.id, task_id)
-    if success:
-        await interaction.response.send_message(f"Task {task_id} completed and removed.")
+@bot.tree.command(name="complete", description="Mark task(s) as complete (removes them)")
+@app_commands.describe(task_ids_str="The ID(s) of the tasks to complete, separated by commas (e.g. 1,5,7)")
+async def complete(interaction: discord.Interaction, task_ids_str: str):
+    # Parse IDs
+    try:
+        task_ids = [int(id_str.strip()) for id_str in task_ids_str.split(',') if id_str.strip().isdigit()]
+    except ValueError:
+        await interaction.response.send_message("Invalid format. Please use numbers separated by commas (e.g. 1,5,7).", ephemeral=True)
+        return
+
+    if not task_ids:
+         await interaction.response.send_message("No valid task IDs found.", ephemeral=True)
+         return
+
+    deleted_count = await database.delete_tasks(interaction.user.id, task_ids)
+    
+    if deleted_count > 0:
+        task_s = "tasks" if deleted_count > 1 else "task"
+        await interaction.response.send_message(f"Marked {deleted_count} {task_s} as complete.")
     else:
-        await interaction.response.send_message(f"Task with ID {task_id} not found (or not yours).", ephemeral=True)
+        await interaction.response.send_message(f"No tasks found with those IDs (or they didn't belong to you).", ephemeral=True)
 
 @bot.tree.command(name="tasks", description="Show 5 upcoming tasks")
 async def tasks_cmd(interaction: discord.Interaction):

@@ -116,6 +116,20 @@ async def delete_task(user_id: int, task_id: int) -> bool:
         await db.commit()
         return cursor.rowcount > 0
 
+async def delete_tasks(user_id: int, task_ids: list[int]) -> int:
+    """Delete multiple tasks at once. Returns count of deleted tasks."""
+    if not task_ids:
+        return 0
+    
+    placeholders = ",".join(["?"] * len(task_ids))
+    sql = f"DELETE FROM tasks WHERE user_id = ? AND id IN ({placeholders})"
+    params = [user_id] + task_ids
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(sql, params)
+        await db.commit()
+        return cursor.rowcount
+
 async def get_top_tasks(user_id: int, limit: int = 5):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
