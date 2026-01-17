@@ -219,6 +219,7 @@ class GiveTaskView(discord.ui.View):
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.green)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         # Pass requester_user_id as assigner_id
         task_id = await database.add_task(self.target_user_id, self.task_name, self.task_date_str, assigner_id=self.requester_user_id)
         date_display = self.bot.format_task_date(self.task_date_str) if self.task_date_str else ""
@@ -227,7 +228,7 @@ class GiveTaskView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"✅ Task accepted and added! **{self.task_name}** ({date_display}) (ID: {task_id})", 
             view=self
         )
@@ -250,12 +251,13 @@ bot = TodoBot()
 @bot.tree.command(name="givetask", description="Assign a task to another user (requires their confirmation)")
 @app_commands.describe(user="The user to assign the task to", name="The task name", date="Due date (YYYY-MM-DD) OR days from now")
 async def givetask(interaction: discord.Interaction, user: discord.User, name: str, date: str = None):
+    await interaction.response.defer(ephemeral=True)
     # Parse date
     final_date_str = None
     if date:
         final_date_str = bot.parse_date(date)
         if final_date_str is None:
-             await interaction.response.send_message("Invalid date format. Please use YYYY-MM-DD or a number of days.", ephemeral=True)
+             await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD or a number of days.")
              return
 
     # Create view
@@ -272,48 +274,50 @@ async def givetask(interaction: discord.Interaction, user: discord.User, name: s
     
     try:
         await user.send(msg, view=view)
-        await interaction.response.send_message(f"Task request sent to {user.mention} via DM.", ephemeral=True)
+        await interaction.followup.send(f"Task request sent to {user.mention} via DM.")
     except discord.Forbidden:
-        await interaction.response.send_message(f"Could not DM {user.mention}. They might have DMs blocked.", ephemeral=True)
+        await interaction.followup.send(f"Could not DM {user.mention}. They might have DMs blocked.")
     except Exception as e:
-        await interaction.response.send_message(f"Failed to send DM: {e}", ephemeral=True)
+        await interaction.followup.send(f"Failed to send DM: {e}")
 
 @bot.tree.command(name="add", description="Add a new task")
 @app_commands.describe(name="The task name", date="Due date (YYYY-MM-DD) OR days from now (e.g. 1 for tomorrow)")
 async def add(interaction: discord.Interaction, name: str, date: str = None):
+    await interaction.response.defer()
     final_date_str = None
     if date:
         final_date_str = bot.parse_date(date)
         if final_date_str is None:
-             await interaction.response.send_message("Invalid date format. Please use YYYY-MM-DD or a number of days.", ephemeral=True)
+             await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD or a number of days.")
              return
 
     # Pass assigner_id=interaction.user.id (explicitly self-assigned)
     task_id = await database.add_task(interaction.user.id, name, final_date_str, assigner_id=interaction.user.id)
     date_display = bot.format_task_date(final_date_str) if final_date_str else ""
-    await interaction.response.send_message(f"Task added: **{name}** ({date_display}) (ID: {task_id})")
+    await interaction.followup.send(f"Task added: **{name}** ({date_display}) (ID: {task_id})")
 
 @bot.tree.command(name="complete", description="Mark task(s) as complete (removes them)")
 @app_commands.describe(task_ids_str="The ID(s) of the tasks to complete, separated by commas (e.g. 1,5,7)")
 async def complete(interaction: discord.Interaction, task_ids_str: str):
+    await interaction.response.defer()
     # Parse IDs
     try:
         task_ids = [int(id_str.strip()) for id_str in task_ids_str.split(',') if id_str.strip().isdigit()]
     except ValueError:
-        await interaction.response.send_message("Invalid format. Please use numbers separated by commas (e.g. 1,5,7).", ephemeral=True)
+        await interaction.followup.send("Invalid format. Please use numbers separated by commas (e.g. 1,5,7).")
         return
 
     if not task_ids:
-         await interaction.response.send_message("No valid task IDs found.", ephemeral=True)
+         await interaction.followup.send("No valid task IDs found.")
          return
 
     deleted_count = await database.delete_tasks(interaction.user.id, task_ids)
     
     if deleted_count > 0:
         task_s = "tasks" if deleted_count > 1 else "task"
-        await interaction.response.send_message(f"Marked {deleted_count} {task_s} as complete.")
+        await interaction.followup.send(f"Marked {deleted_count} {task_s} as complete.")
     else:
-        await interaction.response.send_message(f"No tasks found with those IDs (or they didn't belong to you).", ephemeral=True)
+        await interaction.followup.send(f"No tasks found with those IDs (or they didn't belong to you).")
 
 @bot.tree.command(name="tasks", description="Show 5 upcoming tasks")
 async def tasks_cmd(interaction: discord.Interaction):
@@ -358,9 +362,10 @@ async def alltasks(interaction: discord.Interaction):
 
 @bot.tree.command(name="gettask", description="Get a random task to focus on")
 async def gettask(interaction: discord.Interaction):
+    await interaction.response.defer()
     all_tasks = await database.get_all_undone_tasks_sorted(interaction.user.id)
     if not all_tasks:
-        await interaction.response.send_message("No tasks available! Good job.")
+        await interaction.followup.send("No tasks available! Good job.")
         return
 
     today = datetime.date.today()
@@ -397,9 +402,9 @@ async def gettask(interaction: discord.Interaction):
             reason = "from your backlog"
     
     if target_task:
-         await interaction.response.send_message(f"**Focus Task:** [ID: {target_task['id']}] {target_task['name']} ({reason})")
+         await interaction.followup.send(f"**Focus Task:** [ID: {target_task['id']}] {target_task['name']} ({reason})")
     else:
-         await interaction.response.send_message("No task found.")
+         await interaction.followup.send("No task found.")
 
 @bot.tree.command(name="timezone", description="Set the timezone for daily reminders")
 @app_commands.describe(tz="Timezone code (e.g., PST, EST, US/Pacific)")
