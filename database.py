@@ -159,3 +159,34 @@ async def get_users_with_settings():
         # rs.rows[0] is (value,) or value?
         # Based on previous check, likely tuple/sequence.
         return [row[0] for row in rs.rows]
+
+async def get_all_unique_users_from_tasks():
+    """Get all unique user_ids that have tasks."""
+    async with await get_client() as client:
+        rs = await client.execute("SELECT DISTINCT user_id FROM tasks")
+        if not rs.rows:
+            return []
+        return [int(row[0]) for row in rs.rows] # Ensure int for consistency, though stored as TEXT
+
+async def ensure_user_initialized(user_id: int):
+    """
+    Check if user has settings. If not, initialize with defaults:
+    Timezone: US/Pacific
+    Reminder Time: 08:00
+    """
+    async with await get_client() as client:
+        # Check timezone
+        rs_tz = await client.execute("SELECT value FROM settings WHERE user_id = ? AND key = 'timezone'", [user_id])
+        if not rs_tz.rows:
+            await client.execute(
+                "INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)",
+                [user_id, 'timezone', 'US/Pacific']
+            )
+
+        # Check reminder_time
+        rs_time = await client.execute("SELECT value FROM settings WHERE user_id = ? AND key = 'reminder_time'", [user_id])
+        if not rs_time.rows:
+            await client.execute(
+                "INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)",
+                [user_id, 'reminder_time', '08:00']
+            )

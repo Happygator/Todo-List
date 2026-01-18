@@ -33,16 +33,29 @@ class TodoBot(discord.Client):
     async def on_ready(self):
         print(f'Logged in as {self.user} (ID: {self.user.id})')
         
+        # 1. Initialize settings for all users who have ever created a task
+        existing_users = await database.get_all_unique_users_from_tasks()
+        count_init = 0
+        for u_id in existing_users:
+            await database.ensure_user_initialized(u_id)
+            count_init += 1
+        print(f"Ensured settings for {count_init} users.")
+
+        # 2. Cache users for display purposes (optimization)
+        # We can cache everyone who has settings now (which is everyone with tasks)
         users = await database.get_users_with_settings()
         for user_id in users:
              try:
                 user = await self.fetch_user(user_id)
                 self.user_cache[user_id] = user # cache it
-                # Startup message removed per user request
-                # if user:
-                #    await self.send_daily_summary(user_id, user, is_startup=True)
              except Exception as e:
                 print(f"Failed to cache user {user_id}: {e}")
+
+    async def on_disconnect(self):
+        print("WARNING: Bot disconnected! This often happens if the token is being used elsewhere.")
+        
+    async def on_resumed(self):
+        print("INFO: Bot resumed session.")
 
     async def send_daily_summary(self, user_id, user_obj, is_startup=False):
         # Get timezone 
@@ -60,34 +73,27 @@ class TodoBot(discord.Client):
             
             tasks = await database.get_tasks_for_reminders(user_id, today_str)
             
+            msg_tasks = []
             prefix = "I am online! " if is_startup else "Daily Reminder! "
-            header = f"**{prefix}Here are the tasks due today:**\n"
-            
-            # Fallback (only for startup or if explicit check needed, for reminder we usually only want to send if tasks exist? 
-            # Or user wants to know they are free. 
-            # Requirement: "direct message ... with the current list of tasks that are due today."
-            # If empty, maybe say so?)
-            
-            # For startup, user requested behavior: "if there are no tasks for today, show the 5 most imminent tasks"
-            if not tasks:
-                 upcoming = await database.get_top_tasks(user_id, limit=5)
-                 if upcoming:
-                     header = f"**{prefix}No tasks due today. Here are your upcoming tasks:**\n"
-                     tasks = upcoming
-                 else:
-                     if is_startup:
-                         header = f"**{prefix}No tasks found at all.**"
-                     else:
-                         # For daily reminder, if absolutely nothing, maybe say "No tasks due today!"
-                         header = f"**{prefix}No tasks due today!**"
 
             if tasks:
-                msg = header
-                for task in tasks:
-                    msg += await self.format_task_display(task)
-                await user_obj.send(msg)
+                header = f"**{prefix}Here are the tasks due today:**\n"
+                msg_tasks = tasks
             else:
-                 await user_obj.send(header)
+                # Fallback: Check for any upcoming tasks (limit 5)
+                # This ensures users with tasks (even if not due today) still get a reminder
+                upcoming = await database.get_top_tasks(user_id, limit=5)
+                if upcoming:
+                    header = f"**{prefix}No tasks due today. Here are your upcoming tasks:**\n"
+                    msg_tasks = upcoming
+                else:
+                    # No tasks at all -> Silent
+                    return
+
+            msg = header
+            for task in msg_tasks:
+                msg += await self.format_task_display(task)
+            await user_obj.send(msg)
 
         except Exception as e:
             print(f"Error sending summary to {user_id}: {e}")
@@ -186,7 +192,14 @@ class TodoBot(discord.Client):
 
             now = datetime.datetime.now(timezone)
             
-            if now.hour == 8 and now.minute == 0:
+            # Check user's preferred time (default 08:00)
+            target_time_str = await database.get_setting(user_id, 'reminder_time') or "08:00"
+            try:
+                target_hour, target_minute = map(int, target_time_str.split(':'))
+            except ValueError:
+                target_hour, target_minute = 8, 0
+
+            if now.hour == target_hour and now.minute == target_minute:
                 # Check stored date for this user
                 last_date = self.last_reminder_dates.get(user_id)
                 if last_date == now.date():
@@ -290,6 +303,12 @@ async def add(interaction: discord.Interaction, name: str, date: str = None):
         if final_date_str is None:
              await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD or a number of days.")
              return
+
+             await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD or a number of days.")
+             return
+
+    # Ensure user is initialized (has timezone/reminder time)
+    await database.ensure_user_initialized(interaction.user.id)
 
     # Pass assigner_id=interaction.user.id (explicitly self-assigned)
     task_id = await database.add_task(interaction.user.id, name, final_date_str, assigner_id=interaction.user.id)
@@ -428,6 +447,33 @@ async def timezone_cmd(interaction: discord.Interaction, tz: str):
 
     await database.set_setting(interaction.user.id, 'timezone', target_tz)
     await interaction.response.send_message(f"Timezone set to: {target_tz}")
+
+@bot.tree.command(name="reminder", description="Set or view your daily reminder time")
+@app_commands.describe(time="Optional: Time in 24h format (HH:MM). Leave empty to check current settings.")
+async def reminder_cmd(interaction: discord.Interaction, time: str = None):
+    # Always fetch timezone for display
+    tz_str = await database.get_setting(interaction.user.id, 'timezone') or "Not Set"
+
+    if time is None:
+        # View mode
+        current_time = await database.get_setting(interaction.user.id, 'reminder_time') or "08:00"
+        await interaction.response.send_message(f"Your daily reminder is set for **{current_time}** (Timezone: {tz_str}).", ephemeral=True)
+        return
+
+    # Set mode - Validate format
+    try:
+        hour, minute = map(int, time.split(':'))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        await interaction.response.send_message("Invalid time format. Please use HH:MM (24-hour), e.g., 08:00 or 17:30.", ephemeral=True)
+        return
+
+    # Store normalized string
+    normalized_time = f"{hour:02d}:{minute:02d}"
+    await database.set_setting(interaction.user.id, 'reminder_time', normalized_time)
+    
+    await interaction.response.send_message(f"Daily reminder set for **{normalized_time}** (Timezone: {tz_str}).")
 
 import socket
 import sys
