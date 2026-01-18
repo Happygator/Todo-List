@@ -217,7 +217,7 @@ class TodoBot(discord.Client):
 
 class GiveTaskView(discord.ui.View):
     def __init__(self, target_user_id, requester_user_id, task_name, task_date_str, bot_instance):
-        super().__init__(timeout=300) # 5 minute timeout
+        super().__init__(timeout=86400) # 24 hour timeout
         self.target_user_id = target_user_id
         self.requester_user_id = requester_user_id
         self.task_name = task_name
@@ -229,6 +229,36 @@ class GiveTaskView(discord.ui.View):
             await interaction.response.send_message("This confirmation is not for you!", ephemeral=True)
             return False
         return True
+
+    async def _notify_requester(self, message):
+        try:
+            requester = self.bot.get_user(self.requester_user_id)
+            if not requester:
+                requester = await self.bot.fetch_user(self.requester_user_id)
+            
+            if requester:
+                await requester.send(message)
+        except Exception as e:
+            print(f"Failed to notify requester {self.requester_user_id}: {e}")
+
+    async def on_timeout(self):
+        # Disable buttons
+        for child in self.children:
+            child.disabled = True
+        
+        # Determine the message to edit on the target user's side
+        # Access the message attached to the view if possible. 
+        # In discord.py views, self.message might be set if sent via message.
+        # But for interactions, we might need to be careful.
+        # However, for wait_for/timeout, we can try to edit if we have the message reference.
+        # Since this view is sent via DM using user.send(view=view), the message object is returned.
+        # BUT we didn't store it in __init__ or assignment. 
+        # Actually, when sent via channel.send(), the view is attached.
+        # Limitations: We can't edit the message easily without the message object. 
+        # Let's hope the user clicked something? No, this is timeout.
+        
+        # Notification to requester
+        await self._notify_requester(f"⚠️ Task request **{self.task_name}** to <@{self.target_user_id}> timed out (no response).")
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.green)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -245,6 +275,9 @@ class GiveTaskView(discord.ui.View):
             content=f"✅ Task accepted and added! **{self.task_name}** ({date_display}) (ID: {task_id})", 
             view=self
         )
+        
+        # Notify requester
+        await self._notify_requester(f"✅ <@{self.target_user_id}> accepted your task: **{self.task_name}**")
         self.stop()
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
@@ -257,6 +290,9 @@ class GiveTaskView(discord.ui.View):
             content=f"❌ Task declined: **{self.task_name}**", 
             view=self
         )
+        
+        # Notify requester
+        await self._notify_requester(f"❌ <@{self.target_user_id}> declined your task: **{self.task_name}**")
         self.stop()
 
 bot = TodoBot()
