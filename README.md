@@ -23,6 +23,13 @@ A feature-rich Discord bot to manage your personal to-do list directly within Di
     pip install -r requirements.txt
     ```
 
+    **Raspberry Pi / Linux**:
+    Run the setup script to handle virtual environment creation automatically:
+    ```bash
+    chmod +x setup_pi.sh
+    ./setup_pi.sh
+    ```
+
 3.  **Configuration**:
     Create a `.env` file in the project root:
     ```env
