@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import pytz
 import random
+from typing import Literal
 from dotenv import load_dotenv
 import database
 
@@ -26,6 +27,7 @@ class TodoBot(discord.Client):
     async def setup_hook(self):
         await database.init_db()
         await database.migrate_to_multi_user() # Run migration
+        await database.migrate_add_task_type_column()
         await database.fix_date_formats()
         await self.tree.sync()
         self.daily_reminder.start()
@@ -67,33 +69,60 @@ class TodoBot(discord.Client):
             timezone = pytz.timezone(tz_str)
             now = datetime.datetime.now(timezone)
             today_str = now.date().isoformat()
+            tomorrow_date = now.date() + datetime.timedelta(days=1)
+            tomorrow_str = tomorrow_date.isoformat()
             
             # Rollover past tasks
             await database.rollover_past_tasks(user_id, today_str)
             
-            tasks = await database.get_tasks_for_reminders(user_id, today_str)
+            # Fetch all tasks with due dates
+            all_dated_tasks = await database.get_tasks_for_reminders(user_id)
             
-            msg_tasks = []
-            prefix = "I am online! " if is_startup else "Daily Reminder! "
-
-            if tasks and len(tasks) >= 5:
-                header = f"**{prefix}Here are the tasks due today:**\n"
-                msg_tasks = tasks
+            due_today = []
+            upcoming_appts = []
+            ongoing_projects = []
+            
+            for task in all_dated_tasks:
+                t_date = task['due_date']
+                t_type = task.get('task_type', 'normal')
+                
+                # Logic
+                if t_date == today_str:
+                    due_today.append(task)
+                elif t_type in ['appt', 'appointment'] and t_date == tomorrow_str:
+                    upcoming_appts.append(task)
+                elif t_type == 'project' and t_date > today_str:
+                    ongoing_projects.append(task)
+                    
+            # If we have anything relevant to the reminder rules
+            if due_today or upcoming_appts or ongoing_projects:
+                prefix = "I am online! " if is_startup else "Daily Reminder! "
+                msg = f"**{prefix}**\n"
+                
+                if due_today:
+                    msg += "**Tasks Due Today:**\n"
+                    for t in due_today:
+                        msg += await self.format_task_display(t)
+                    msg += "\n"
+                    
+                if upcoming_appts:
+                    msg += "**Upcoming Appointments:**\n"
+                    for t in upcoming_appts:
+                        msg += await self.format_task_display(t)
+                    msg += "\n"
+                    
+                if ongoing_projects:
+                    msg += "**Ongoing Projects:**\n"
+                    for t in ongoing_projects:
+                        msg += await self.format_task_display(t)
+                    msg += "\n"
+                    
+                await user_obj.send(msg)
             else:
-                # Not enough tasks due today, send the 10 most due tasks instead
-                if tasks:
-                    header = f"**{prefix}Here are your upcoming tasks:**\n"
-                else:
-                    header = f"**{prefix}No tasks due today. Here are your upcoming tasks:**\n"
-                upcoming = await database.get_top_tasks(user_id, limit=10)
-                if upcoming:
-                    msg_tasks = upcoming
-                else:
-                    return
-            msg = header
-            for task in msg_tasks:
-                msg += await self.format_task_display(task)
-            await user_obj.send(msg)
+                # No specific reminders. 
+                # User asked to change daily reminder to include... 
+                # This logic is what handles the "include".
+                pass
 
         except Exception as e:
             print(f"Error sending summary to {user_id}: {e}")
@@ -330,8 +359,9 @@ async def givetask(interaction: discord.Interaction, user: discord.User, name: s
         await interaction.followup.send(f"Failed to send DM: {e}")
 
 @bot.tree.command(name="add", description="Add a new task")
-@app_commands.describe(name="The task name", date="Due date (YYYY-MM-DD) OR days from now (e.g. 1 for tomorrow)")
-async def add(interaction: discord.Interaction, name: str, date: str = None):
+@app_commands.describe(name="The task name", date="Due date (YYYY-MM-DD) OR days from now", task_type="Type of task (normal, appt, project)")
+@app_commands.rename(task_type='type')
+async def add(interaction: discord.Interaction, name: str, date: str = None, task_type: Literal['normal', 'appt', 'project'] = 'normal'):
     await interaction.response.defer()
     final_date_str = None
     if date:
@@ -339,17 +369,14 @@ async def add(interaction: discord.Interaction, name: str, date: str = None):
         if final_date_str is None:
              await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD or a number of days.")
              return
-
-             await interaction.followup.send("Invalid date format. Please use YYYY-MM-DD or a number of days.")
-             return
-
-    # Ensure user is initialized (has timezone/reminder time)
+             
+    # Ensure user is initialized
     await database.ensure_user_initialized(interaction.user.id)
 
-    # Pass assigner_id=interaction.user.id (explicitly self-assigned)
-    task_id = await database.add_task(interaction.user.id, name, final_date_str, assigner_id=interaction.user.id)
+    # Pass specific type
+    task_id = await database.add_task(interaction.user.id, name, final_date_str, assigner_id=interaction.user.id, task_type=task_type)
     date_display = bot.format_task_date(final_date_str) if final_date_str else ""
-    await interaction.followup.send(f"Task added: **{name}** ({date_display}) (ID: {task_id})")
+    await interaction.followup.send(f"Task added: **{name}** ({date_display}) [{task_type}] (ID: {task_id})")
 
 @bot.tree.command(name="complete", description="Mark task(s) as complete (removes them)")
 @app_commands.describe(task_ids_str="The ID(s) of the tasks to complete, separated by commas (e.g. 1,5,7)")
@@ -374,19 +401,140 @@ async def complete(interaction: discord.Interaction, task_ids_str: str):
     else:
         await interaction.followup.send(f"No tasks found with those IDs (or they didn't belong to you).")
 
-@bot.tree.command(name="tasks", description="Show 5 upcoming tasks")
+@bot.tree.command(name="tasks", description="Show upcoming tasks")
 async def tasks_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
-    tasks = await database.get_top_tasks(interaction.user.id, limit=5)
+    # Get all tasks to categorize
+    tasks = await database.get_all_undone_tasks_sorted(interaction.user.id)
+    
     if not tasks:
         await interaction.followup.send("No upcoming tasks found.")
         return
 
-    msg = "**Upcoming Tasks:**\n"
-    for task in tasks:
-        msg += await bot.format_task_display(task)
+    # Determine "tomorrow" based on user timezone if possible
+    tz_str = await database.get_setting(interaction.user.id, 'timezone')
+    try:
+        if tz_str:
+            timezone = pytz.timezone(tz_str)
+            today_date = datetime.datetime.now(timezone).date()
+        else:
+            today_date = datetime.date.today()
+    except:
+        today_date = datetime.date.today()
+        
+    today_str = today_date.isoformat()
+    tomorrow_str = (today_date + datetime.timedelta(days=1)).isoformat()
+
+    normal_tasks = []
+    appts = []
+    projects = []
     
-    await interaction.followup.send(msg)
+    for t in tasks:
+        t_type = t.get('task_type', 'normal')
+        if t_type in ['appt', 'appointment']:
+            # Only include appointments explicitly due tomorrow
+            if t['due_date'] == tomorrow_str:
+                appts.append(t)
+        elif t_type == 'project':
+            projects.append(t)
+        else:
+            normal_tasks.append(t)
+            
+    lines = []
+    
+    def add_section_with_separator(title, task_list):
+        lines.append(f"**{title}**\n")
+        separator_added = False
+        any_tasks_printed = False
+        
+        for t in task_list:
+            # Check for separator condition: First task that is strictly in the future (tomorrow onwards)
+            # We add separator if we have printed previous tasks (which were <= today) and now we are at > today
+            # OR if we just want to separate 'today/overdue' from 'future'.
+            # Logic: If we haven't added separator, and this task is future, and we have printed tasks before.
+            # Wait, if the first task is future, we don't need separator at top? Or maybe we do?
+            # User said: "between tasks that are due today and tasks that are not due today".
+            # If start with future, no "due today". No separator.
+            # If end with today, no future. No separator.
+            # Only if transition from <= today to > today.
+            
+            d = t['due_date']
+            is_future = False
+            if d:
+                if d > today_str:
+                    is_future = True
+            else:
+                 is_future = True # No date = future/backlog
+
+            if is_future and not separator_added and any_tasks_printed:
+                lines.append("----------------\n")
+                separator_added = True
+            
+            # format_task_display is async... wrap this?
+            # We can't call async in sync function easily without loop argument, but we are in async def.
+            # I can't define async inner nicely if not careful.
+            # I'll just do loop inline instead of helper function to avoid async complexity or await issues.
+            pass
+
+    # Normal Tasks
+    if normal_tasks:
+        lines.append("**Tasks:**\n")
+        separator_added = False
+        has_past_or_today = False
+        
+        for t in normal_tasks:
+            d = t['due_date']
+            is_future = (d > today_str) if d else True # None is future
+            
+            if is_future and not separator_added and has_past_or_today:
+                lines.append("----------------\n")
+                separator_added = True
+            
+            if not is_future:
+                has_past_or_today = True
+                
+            lines.append(await bot.format_task_display(t))
+        lines.append("\n")
+        
+    if appts:
+        lines.append("**Appointments (Tomorrow):**\n")
+        for t in appts:
+            lines.append(await bot.format_task_display(t))
+        lines.append("\n")
+        
+    if projects:
+        lines.append("**Projects:**\n")
+        separator_added = False
+        has_past_or_today = False
+        
+        for t in projects:
+            d = t['due_date']
+            is_future = (d > today_str) if d else True 
+            
+            if is_future and not separator_added and has_past_or_today:
+                lines.append("----------------\n")
+                separator_added = True
+                
+            if not is_future:
+                has_past_or_today = True
+
+            lines.append(await bot.format_task_display(t))
+        lines.append("\n")
+            
+    if not lines:
+        await interaction.followup.send("No tasks found.")
+        return
+
+    current_msg = ""
+    for line in lines:
+        if len(current_msg) + len(line) > 1900:
+            await interaction.followup.send(current_msg)
+            current_msg = line
+        else:
+            current_msg += line
+            
+    if current_msg:
+        await interaction.followup.send(current_msg)
 
 @bot.tree.command(name="alltasks", description="Show all tasks")
 async def alltasks(interaction: discord.Interaction):

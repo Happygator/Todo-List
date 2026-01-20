@@ -25,7 +25,8 @@ async def init_db():
                 name TEXT NOT NULL,
                 due_date TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                assigner_id TEXT
+                assigner_id TEXT,
+                task_type TEXT DEFAULT 'normal'
             )
         """)
         
@@ -38,6 +39,17 @@ async def init_db():
             )
         """)
 
+async def migrate_add_task_type_column():
+    """Adds task_type column if it doesn't exist."""
+    async with await get_client() as client:
+        try:
+            # Check if column exists by selecting it from one row
+            await client.execute("SELECT task_type FROM tasks LIMIT 1")
+        except:
+            # Likely doesn't exist (LibsqlError or similar)
+            print("Migrating: Adding task_type column to tasks table...")
+            await client.execute("ALTER TABLE tasks ADD COLUMN task_type TEXT DEFAULT 'normal'")
+
 async def migrate_to_multi_user():
     # No-op for Turso as we assume schema is correct or handled by migration script/init
     pass
@@ -48,7 +60,7 @@ async def fix_date_formats():
     # Turso is remote, minimizing round trips is good.
     pass
 
-async def add_task(user_id: int, name: str, due_date: str = None, assigner_id: int = None) -> int:
+async def add_task(user_id: int, name: str, due_date: str = None, assigner_id: int = None, task_type: str = 'normal') -> int:
     if assigner_id is None:
         assigner_id = user_id
         
@@ -59,8 +71,8 @@ async def add_task(user_id: int, name: str, due_date: str = None, assigner_id: i
         # Turso supports RETURNING.
         
         rs = await client.execute(
-            "INSERT INTO tasks (user_id, name, due_date, assigner_id) VALUES (?, ?, ?, ?) RETURNING id",
-            [user_id, name, due_date, assigner_id]
+            "INSERT INTO tasks (user_id, name, due_date, assigner_id, task_type) VALUES (?, ?, ?, ?, ?) RETURNING id",
+            [user_id, name, due_date, assigner_id, task_type]
         )
         return rs.rows[0][0]
 
@@ -103,9 +115,11 @@ async def get_top_tasks(user_id: int, limit: int = 5):
         columns = list(rs.columns)
         return [row_to_dict(row, columns) for row in rs.rows]
 
-async def get_tasks_for_reminders(user_id: int, target_date: str):
+async def get_tasks_for_reminders(user_id: int):
+    """Fetch all tasks with a due date to process for reminders logic (complex types)."""
     async with await get_client() as client:
-        rs = await client.execute("SELECT * FROM tasks WHERE user_id = ? AND due_date = ?", [user_id, target_date])
+        # specific query for efficiency: only those with due dates
+        rs = await client.execute("SELECT * FROM tasks WHERE user_id = ? AND due_date IS NOT NULL", [user_id])
         columns = list(rs.columns)
         return [row_to_dict(row, columns) for row in rs.rows]
             
