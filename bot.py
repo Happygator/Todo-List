@@ -76,20 +76,20 @@ class TodoBot(discord.Client):
             msg_tasks = []
             prefix = "I am online! " if is_startup else "Daily Reminder! "
 
-            if tasks:
+            if tasks and len(tasks) >= 5:
                 header = f"**{prefix}Here are the tasks due today:**\n"
                 msg_tasks = tasks
             else:
-                # Fallback: Check for any upcoming tasks (limit 5)
-                # This ensures users with tasks (even if not due today) still get a reminder
-                upcoming = await database.get_top_tasks(user_id, limit=5)
-                if upcoming:
+                # Not enough tasks due today, send the 10 most due tasks instead
+                if tasks:
+                    header = f"**{prefix}Here are your upcoming tasks:**\n"
+                else:
                     header = f"**{prefix}No tasks due today. Here are your upcoming tasks:**\n"
+                upcoming = await database.get_top_tasks(user_id, limit=10)
+                if upcoming:
                     msg_tasks = upcoming
                 else:
-                    # No tasks at all -> Silent
                     return
-
             msg = header
             for task in msg_tasks:
                 msg += await self.format_task_display(task)
