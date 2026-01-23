@@ -210,35 +210,42 @@ class TodoBot(discord.Client):
         user_ids = await database.get_users_with_settings()
         
         for user_id in user_ids:
-            tz_str = await database.get_setting(user_id, 'timezone')
-            if not tz_str:
-                continue
-            
             try:
-                timezone = pytz.timezone(tz_str)
-            except pytz.UnknownTimeZoneError:
-                continue
-
-            now = datetime.datetime.now(timezone)
-            
-            # Check user's preferred time (default 08:00)
-            target_time_str = await database.get_setting(user_id, 'reminder_time') or "08:00"
-            try:
-                target_hour, target_minute = map(int, target_time_str.split(':'))
-            except ValueError:
-                target_hour, target_minute = 8, 0
-
-            if now.hour == target_hour and now.minute == target_minute:
-                # Check stored date for this user
-                last_date = self.last_reminder_dates.get(user_id)
-                if last_date == now.date():
-                    continue 
-
-                user = await self.fetch_user(user_id)
-                if user:
-                    await self.send_daily_summary(user_id, user, is_startup=False)
+                tz_str = await database.get_setting(user_id, 'timezone')
+                if not tz_str:
+                    continue
                 
-                self.last_reminder_dates[user_id] = now.date()
+                try:
+                    timezone = pytz.timezone(tz_str)
+                except pytz.UnknownTimeZoneError:
+                    continue
+
+                now = datetime.datetime.now(timezone)
+                
+                # Check user's preferred time (default 08:00)
+                target_time_str = await database.get_setting(user_id, 'reminder_time') or "08:00"
+                try:
+                    target_hour, target_minute = map(int, target_time_str.split(':'))
+                except ValueError:
+                    target_hour, target_minute = 8, 0
+
+                if now.hour == target_hour and now.minute == target_minute:
+                    # Check stored date for this user
+                    last_date = self.last_reminder_dates.get(user_id)
+                    if last_date == now.date():
+                        continue 
+
+                    # Try cache first to be faster
+                    user = self.get_user(user_id)
+                    if not user:
+                        user = await self.fetch_user(user_id)
+
+                    if user:
+                        await self.send_daily_summary(user_id, user, is_startup=False)
+                    
+                    self.last_reminder_dates[user_id] = now.date()
+            except Exception as e:
+                print(f"Error in daily reminder for user {user_id}: {e}")
 
     @daily_reminder.before_loop
     async def before_daily_reminder(self):
